@@ -98,13 +98,12 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
         Validate environment and set up headers for GitHub Copilot API.
 
         Uses the Authenticator to obtain GitHub Copilot API key via OAuth Device Flow,
-        then configures all required headers for the Responses API.
+        then configures base headers. Input-dependent headers (X-Initiator, vision)
+        are set in transform_responses_api_request() where input is available.
 
         Headers include:
         - Authorization with API key
         - Standard GitHub Copilot headers (editor-version, user-agent, etc.)
-        - X-Initiator based on input analysis
-        - copilot-vision-request if vision content detected
         - User-provided extra_headers (merged with priority)
         """
         try:
@@ -123,24 +122,6 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
             # Merge with existing headers (user's extra_headers take priority)
             merged_headers = {**default_headers, **headers}
-
-            # Analyze input to determine additional headers
-            input_param = self._get_input_from_params(litellm_params)
-
-            # Add X-Initiator header based on input analysis
-            if input_param is not None:
-                initiator = self._get_initiator(input_param)
-                merged_headers["X-Initiator"] = initiator
-                verbose_logger.debug(
-                    f"GitHub Copilot Responses API: Set X-Initiator={initiator}"
-                )
-
-                # Add vision header if input contains images
-                if self._has_vision_input(input_param):
-                    merged_headers["copilot-vision-request"] = "true"
-                    verbose_logger.debug(
-                        "GitHub Copilot Responses API: Enabled vision request"
-                    )
 
             verbose_logger.debug(
                 f"GitHub Copilot Responses API: Successfully configured headers for model {model}"
@@ -182,6 +163,98 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
         # Return the responses endpoint
         return f"{api_base}/responses"
 
+    def transform_responses_api_request(
+        self,
+        model: str,
+        input: Union[str, ResponseInputParam],
+        response_api_optional_request_params: Dict,
+        litellm_params: GenericLiteLLMParams,
+        headers: dict,
+    ) -> Dict:
+        """
+        Transform the Responses API request for GitHub Copilot.
+
+        Sets input-dependent headers (X-Initiator, copilot-vision-request) and
+        delegates to parent class for standard transformation.
+
+        Args:
+            model: Model name
+            input: Input data (string or structured input)
+            response_api_optional_request_params: Optional parameters
+            litellm_params: LiteLLM parameters
+            headers: Request headers to update
+
+        Returns:
+            Transformed request parameters
+        """
+        # Set X-Initiator header based on input analysis (only if not already set)
+        if "X-Initiator" not in headers:
+            initiator = self._get_initiator(input)
+            headers["X-Initiator"] = initiator
+            verbose_logger.debug(
+                f"GitHub Copilot Responses API: Set X-Initiator={initiator}"
+            )
+
+        # Add vision header if input contains images (only if not already set)
+        if "copilot-vision-request" not in headers and self._has_vision_input(input):
+            headers["copilot-vision-request"] = "true"
+            verbose_logger.debug(
+                "GitHub Copilot Responses API: Enabled vision request"
+            )
+
+        # Call parent class for standard transformation
+        return super().transform_responses_api_request(
+            model=model,
+            input=input,
+            response_api_optional_request_params=response_api_optional_request_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+    def _handle_reasoning_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle reasoning items for GitHub Copilot, preserving encrypted_content.
+
+        GitHub Copilot uses encrypted_content in reasoning items to maintain
+        conversation state across turns. The parent class strips this field
+        when converting to OpenAI's ResponseReasoningItem model, which causes
+        "encrypted content could not be verified" errors on multi-turn requests.
+
+        This override preserves encrypted_content while still filtering out
+        status=None which OpenAI's API rejects.
+
+        Args:
+            item: The reasoning item dictionary to process
+
+        Returns:
+            Filtered reasoning item with encrypted_content preserved
+        """
+        if item.get("type") == "reasoning":
+            # Preserve encrypted_content before processing
+            encrypted_content = item.get("encrypted_content")
+
+            # Filter out None values for known problematic fields,
+            # but preserve encrypted_content if present
+            filtered_item: Dict[str, Any] = {}
+            for k, v in item.items():
+                # Always include encrypted_content if present (even if None check)
+                if k == "encrypted_content":
+                    if encrypted_content is not None:
+                        filtered_item[k] = v
+                    continue
+                # Filter out status=None which OpenAI API rejects
+                if k == "status" and v is None:
+                    continue
+                # Include all other non-None values
+                if v is not None:
+                    filtered_item[k] = v
+
+            verbose_logger.debug(
+                f"GitHub Copilot reasoning item processed, encrypted_content preserved: {encrypted_content is not None}"
+            )
+            return filtered_item
+        return item
+
     # ==================== Helper Methods ====================
 
     def _get_default_headers(self, api_key: str) -> Dict[str, str]:
@@ -202,26 +275,6 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "x-request-id": str(uuid4()),
             "x-vscode-user-agent-library-version": "electron-fetch",
         }
-
-    def _get_input_from_params(
-        self, litellm_params: Optional[GenericLiteLLMParams]
-    ) -> Optional[Union[str, ResponseInputParam]]:
-        """
-        Extract input parameter from litellm_params.
-
-        The input parameter contains the conversation history and is needed
-        for vision detection and initiator determination.
-        """
-        if litellm_params is None:
-            return None
-
-        # Try to get input from litellm_params
-        # This might be in different locations depending on how LiteLLM structures it
-        if hasattr(litellm_params, "input"):
-            return litellm_params.input
-
-        # If not found, return None and let the API handle it
-        return None
 
     def _get_initiator(self, input_param: Union[str, ResponseInputParam]) -> str:
         """
